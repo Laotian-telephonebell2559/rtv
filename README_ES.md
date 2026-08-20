@@ -188,7 +188,7 @@ script [`scripts/build-termux.sh`](scripts/build-termux.sh) lo hace todo:
 
 ```bash
 pkg install -y git
-git clone https://github.com/correo415415/rtv.git && cd rtv
+git clone https://github.com/Santitub/rtv.git && cd rtv
 bash scripts/build-termux.sh
 rtv vídeo.mp4
 ```
