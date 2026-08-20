@@ -530,10 +530,11 @@ Hecho:
 - [x] GUI de ventana (`--gui`, winit + wgpu + egui) compartiendo el mismo
       núcleo de reproducción que el terminal
 
-Pendiente:
-
-- [ ] Medir la ganancia de `--hwdec` en una máquina con GPU real
-      (el sandbox de CI no tiene `/dev/dri`)
+- [x] Benchmark de estrés de decode por hardware (`tests/stress_hwdec_bench.py`):
+      compara `--hwdec auto` vs `--hwdec none` (mide la ganancia real de CPU
+      cuando detecta una GPU, se degrada a una verificación de consistencia cuando
+      no la detecta) y se enfrenta contra `mpv --vo=tct` cuando mpv está en el
+      PATH
 
 ## Licencia
 
