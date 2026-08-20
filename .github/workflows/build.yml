@@ -1,0 +1,1011 @@
+# Builds rtv for Windows, Linux and macOS with FFmpeg 7.1 BUNDLED inside
+# each artifact: the end user does NOT need to install FFmpeg.
+#
+# Why FFmpeg 7.1 exactly: ffmpeg-the-third 5.0 uses AVCodecID V410/V308
+# (they only exist since 7.1) and legacy AVCodec fields removed in 8.0
+# (see BUILD-WINDOWS.md). 7.1.x is the only branch that compiles.
+#
+# Per-OS strategy (all of it validated):
+#   * Linux (x86_64 + arm64): FFmpeg 7.1.5 built from source (minimal LGPL
+#     config: decode only, + dav1d for AV1 and VAAPI for hwdec) and cached.
+#     The BtbN builds are NOT used here: their .so files carry implib-gen
+#     stubs that lazily dlopen libva/libvdpau/etc. and ABORT with an assert
+#     when the lib is not installed — rtv used to crash while probing
+#     --hwdec auto on any machine without libva (seen on CI). With our own
+#     build libva is dynamically linked AND bundled: if the user's machine
+#     has no VAAPI driver, av_hwdevice_ctx_create fails CLEANLY and rtv
+#     falls back to software. The full closure of non-system deps is
+#     bundled with RPATH $ORIGIN (patchelf); user requirements:
+#     glibc >= 2.35 (Ubuntu 22.04+) and libasound2.
+#   * Windows (x86_64): BtbN "win64-lgpl-shared" (equivalent to the winget
+#     BtbN.FFmpeg.*.Shared.7.1 that BUILD-WINDOWS.md uses). FFMPEG_DIR + the
+#     5 DLLs copied next to rtv.exe (Windows resolves DLLs from the exe dir).
+#   * macOS (x86_64 + arm64): there is no BtbN for macOS -> FFmpeg 7.1.5 is
+#     built from source (minimal LGPL config: decode only, no
+#     avfilter/avdevice/encoders, + dav1d for AV1 and VideoToolbox for hwdec),
+#     cached, and the dylibs are bundled with dylibbundler
+#     (@executable_path/libs) + ad-hoc re-signing (mandatory on arm64).
+#     Runners: macos-15-intel (macos-13 was retired in Dec 2025) and macos-14.
+#   * Termux/Android (x86_64 + aarch64): build and tests INSIDE
+#     termux/termux-docker containers (real Termux userland, no physical
+#     device) with scripts/build-termux.sh — the same script a user runs on
+#     their phone. Includes a real AUDIO test against PulseAudio with a
+#     null-sink.
+
+name: build
+
+# Triggers: manual ONLY (Actions -> build -> Run workflow) and v* tags
+# (creating a release is a deliberate act, not "pushing a commit").
+# It deliberately does NOT run on pushes to main.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Create a GitHub Release with this tag (e.g. v0.5.0). Empty = artifacts only, no release."
+        type: string
+        default: ""
+      release_message:
+        description: "Release message (Markdown supported: **bold**, lists, links…). Goes above the downloads table."
+        type: string
+        default: ""
+      prerelease:
+        description: "Mark the release as a pre-release"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # BtbN/FFmpeg-Builds for Windows. Careful: the "latest" release NO
+  # longer publishes the 7.1 branch (since Aug 2026 it only ships
+  # 8.1/9.0), so a dated autobuild tag that still keeps it is pinned +
+  # the exact asset name (it embeds the build's git hash, not derivable).
+  FF_WIN_TAG: "autobuild-2026-08-16-13-00"
+  FF_WIN_ASSET: "ffmpeg-n7.1.5-16-g9a4bb2c579-win64-lgpl-shared-7.1.zip"
+  # Source tarball for Linux and macOS (latest published 7.1.x).
+  FF_SRC_VERSION: "7.1.5"
+
+jobs:
+  # ---------------------------------------------------------------- Linux --
+  linux:
+    name: linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04       # glibc 2.35 -> forward compatible
+            arch: x86_64
+          - runner: ubuntu-22.04-arm   # free ARM runners on public repos
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: System dependencies
+        run: |
+          # The runners' azure.archive.ubuntu.com mirror goes down every
+          # now and then and apt HANGS retrying (linux-x86_64 was seen
+          # >30 min inside apt-get while arm64 finished in minutes).
+          # The official archive is forced as the only mirror (the runners
+          # resolve a mirrorlist in /etc/apt/apt-mirrors.txt) plus short
+          # timeouts so a slow mirror fails fast.
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            printf 'https://archive.ubuntu.com/ubuntu/\tpriority:1\n' \
+              | sudo tee /etc/apt/apt-mirrors.txt
+          fi
+          sudo tee /etc/apt/apt.conf.d/99-rtv-timeouts > /dev/null << 'APTCONF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "20";
+          Acquire::https::Timeout "20";
+          APTCONF
+          sudo apt-get update
+          # ffmpeg (the apt CLI) is only for generating the smoke test
+          # video; nasm for FFmpeg's x86 asm; dav1d/va/drm are dynamically
+          # linked and bundled into the artifact.
+          # libgnutls28-dev: TLS for libavformat's https protocol (network
+          # playback). GnuTLS is LGPLv2.1+ — it keeps the build's
+          # "LGPL 2.1 or later" license (openssl/mbedtls would require
+          # --enable-version3).
+          # pulseaudio(+utils): real server with a null-sink for the dual
+          # input test (the runner has no audio hardware).
+          # xvfb/xdotool/imagemagick + mesa (llvmpipe/lavapipe): headless
+          # X11 environment with software rendering for the GUI
+          # integration test (tests/integration_gui.py).
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev pkg-config patchelf clang libclang-dev nasm \
+            libdav1d-dev libva-dev libdrm-dev libgnutls28-dev ffmpeg \
+            pulseaudio pulseaudio-utils \
+            xvfb xdotool imagemagick mesa-vulkan-drivers libvulkan1 \
+            libegl1 libgl1-mesa-dri libxkbcommon0 libxkbcommon-x11-0
+
+      - name: Built FFmpeg cache
+        id: ffcache
+        uses: actions/cache@v6
+        with:
+          path: ~/ffmpeg
+          key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-vaapi-gnutls-${{ matrix.runner }}-v1
+
+      - name: Build FFmpeg ${{ env.FF_SRC_VERSION }} from source (minimal LGPL)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # GitHub mirror as primary (ffmpeg.org resets connections from
+          # runners); fallback to the official tarball.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg-src.tar \
+            "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n${FF_SRC_VERSION}.tar.gz" || \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg-src.tar \
+            "https://ffmpeg.org/releases/ffmpeg-${FF_SRC_VERSION}.tar.xz"
+          mkdir -p /tmp/ffmpeg-src
+          tar -xf /tmp/ffmpeg-src.tar -C /tmp/ffmpeg-src --strip-components=1
+          cd /tmp/ffmpeg-src
+          # Minimal config for rtv: DECODE only. No avfilter/avdevice or
+          # encoders/muxers. dav1d = decent AV1; vaapi = hwdec (normal
+          # dynamic linking, WITHOUT BtbN's dlopen+assert stubs).
+          # --disable-xlib/libxcb: VAAPI via DRM render nodes only (the
+          # modern path) -> libX11 and friends are not dragged into the
+          # package. Verified locally: configure OK with CONFIG_VAAPI=1
+          # and CONFIG_LIBDAV1D=1, license "LGPL version 2.1 or later".
+          # gnutls = https (network playback); network is enabled by
+          # default (http/tcp/hls…), only the TLS layer is missing.
+          ./configure --prefix="$HOME/ffmpeg" \
+            --enable-shared --disable-static \
+            --disable-programs --disable-doc \
+            --disable-avdevice --disable-avfilter \
+            --disable-encoders --disable-muxers \
+            --disable-xlib --disable-libxcb \
+            --enable-libdav1d --enable-vaapi \
+            --enable-gnutls
+          # If https did not get compiled in, better to blow up here than
+          # to publish a package without network playback.
+          grep -q "CONFIG_HTTPS_PROTOCOL 1" config_components.h
+          make -j"$(nproc)"
+          make install
+          cp COPYING.LGPLv2.1 "$HOME/ffmpeg/LICENSE.txt"
+
+      - name: Build
+        run: |
+          echo "FFMPEG_DIR=$HOME/ffmpeg" >> "$GITHUB_ENV"
+          export FFMPEG_DIR="$HOME/ffmpeg"
+          cargo build --release --locked
+
+      - name: Unit tests
+        env:
+          LD_LIBRARY_PATH: ${{ env.FFMPEG_DIR }}/lib
+        run: cargo test --release --locked
+
+      - name: Package (binary + non-system lib closure, RPATH $ORIGIN)
+        id: pkg
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then ver="$GITHUB_REF_NAME"
+          elif [[ -n "${{ inputs.release_tag }}" ]]; then ver="${{ inputs.release_tag }}"
+          else ver="${GITHUB_SHA::7}"; fi
+          pkg="rtv-${ver}-linux-${{ matrix.arch }}"
+          mkdir -p "dist/$pkg/lib"
+          cp target/release/rtv "dist/$pkg/"
+          # Transitive closure of NON-system dependencies (ffmpeg + dav1d +
+          # libva...): everything ldd resolves except the glibc family,
+          # libgcc and libasound (that one is system-owned by design: its
+          # ALSA plugins cannot be bundled).
+          sysre='linux-vdso|ld-linux|libc\.so|libm\.so|libdl\.so|libpthread\.so|librt\.so|libgcc_s|libmvec|libasound'
+          count=0
+          while read -r name path; do
+            [[ "$name" =~ $sysre ]] && continue
+            cp -L "$path" "dist/$pkg/lib/"
+            count=$((count+1))
+          done < <(LD_LIBRARY_PATH="$FFMPEG_DIR/lib" ldd target/release/rtv | awk '/=>/ {print $1, $3}')
+          echo "bundled libs: $count"; ls "dist/$pkg/lib/"
+          test "$count" -ge 5   # sanity: at least ffmpeg's 5
+          # https: the gnutls chain (nettle/hogweed/gmp…) must be part of
+          # the closure — without it the package cannot play over TLS.
+          ls "dist/$pkg/lib/"libgnutls*
+          # RPATH: $ORIGIN/lib on the binary; $ORIGIN on each lib so they
+          # resolve to their siblings in the same dir (e.g. avutil -> libva).
+          patchelf --set-rpath '$ORIGIN/lib' "dist/$pkg/rtv"
+          for so in "dist/$pkg/lib/"*; do patchelf --set-rpath '$ORIGIN' "$so"; done
+          cp "$FFMPEG_DIR/LICENSE.txt" "dist/$pkg/LICENSE-ffmpeg.txt"
+          cp README.md "dist/$pkg/"
+          # Official standalone yt-dlp (for YouTube URLs and the like).
+          # rtv prefers the user's PATH one when present; this is the
+          # "works right after unpacking" fallback. It supports
+          # self-update (yt-dlp -U), so it does not stay frozen.
+          case "${{ matrix.arch }}" in
+            x86_64) ytdlp_asset=yt-dlp_linux ;;
+            arm64)  ytdlp_asset=yt-dlp_linux_aarch64 ;;
+          esac
+          curl -fsSL --retry 5 --retry-all-errors -o "dist/$pkg/yt-dlp" \
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/$ytdlp_asset"
+          chmod +x "dist/$pkg/yt-dlp"
+          "dist/$pkg/yt-dlp" --version   # sanity: it starts on this arch
+          cp ci/LICENSE-yt-dlp.txt "dist/$pkg/"
+          tar -C dist -czf "$pkg.tar.gz" "$pkg"
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (relocatable package, no system FFmpeg)
+        run: |
+          set -euo pipefail
+          pkg="${{ steps.pkg.outputs.pkg }}"
+          # Copy the package to another path to test real relocatability.
+          cp -r "dist/$pkg" /tmp/smoke-pkg
+          # Libs must resolve INSIDE the package, nothing "not found".
+          ldd /tmp/smoke-pkg/rtv | tee /tmp/ldd.txt
+          ! grep -q "not found" /tmp/ldd.txt
+          grep -E "libav|libsw" /tmp/ldd.txt | grep -qv "/tmp/smoke-pkg/lib" && exit 1 || true
+          /tmp/smoke-pkg/rtv --version
+          # Test video via the apt ffmpeg CLI (test fixture only).
+          ffmpeg -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 2 \
+            -c:v mpeg4 -an /tmp/smoke.mp4
+          # Our own pty harness (fixed winsize + continuous draining +
+          # diagnostic dump on failure): the runner's util-linux 2.37
+          # `script` mishandles non-TTY stdin and the child died with
+          # SIGABRT (exit 134).
+          python3 ci/smoke_pty.py /tmp/smoke-pkg/rtv /tmp/smoke.mp4
+
+      - name: NETWORK smoke test (local http, --info + playback)
+        run: |
+          set -euo pipefail
+          # Local http server serving the fixture: validates libavformat's
+          # network stack end to end (open → demux → decode → render)
+          # without relying on external hosts. The TLS layer was already
+          # verified in config.h + bundled libgnutls.
+          python3 -m http.server 8123 --bind 127.0.0.1 --directory /tmp &
+          srv=$!; trap 'kill $srv' EXIT
+          sleep 1
+          /tmp/smoke-pkg/rtv --info http://127.0.0.1:8123/smoke.mp4
+          python3 ci/smoke_pty.py /tmp/smoke-pkg/rtv http://127.0.0.1:8123/smoke.mp4
+
+      - name: DUAL INPUT test (video and audio on separate URLs)
+        run: |
+          set -euo pipefail
+          # The YouTube DASH scenario reproduced locally: one VIDEO-only
+          # input and one AUDIO-only input served over http. Real
+          # PulseAudio with a null-sink (same recipe as the termux job)
+          # and the checker demanding the audio clock to anchor and
+          # advance — validates dual demux + sync, not just "no crash".
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=ci_sink
+          ffmpeg -y -loglevel error -f lavfi -i testsrc2=size=320x180:rate=30 \
+            -t 6 -c:v mpeg4 -an -movflags +faststart /tmp/dual_v.mp4
+          ffmpeg -y -loglevel error -f lavfi -i sine=frequency=440:sample_rate=48000 \
+            -t 6 -c:a aac -movflags +faststart /tmp/dual_a.m4a
+          python3 -m http.server 8124 --bind 127.0.0.1 --directory /tmp &
+          srv=$!; trap 'kill $srv' EXIT
+          sleep 1
+          # --info must probe the separate audio input too.
+          /tmp/smoke-pkg/rtv --info http://127.0.0.1:8124/dual_v.mp4 \
+            --audio-file http://127.0.0.1:8124/dual_a.m4a | tee /tmp/dualinfo.txt
+          grep -q "separate input" /tmp/dualinfo.txt
+          grep -q "aac" /tmp/dualinfo.txt
+          python3 ci/termux_audio_check.py /tmp/smoke-pkg/rtv \
+            http://127.0.0.1:8124/dual_v.mp4 \
+            --audio-file http://127.0.0.1:8124/dual_a.m4a --audio-backend pulse
+
+      - name: AUTO-ROTATION test (Display Matrix)
+        run: |
+          set -euo pipefail
+          # A "phone" video: landscape 320x180 + a 90° Display Matrix.
+          # rtv must present it PORTRAIT (180x320): --info verifies it
+          # without a PTY, and the integration test checks the output
+          # PIXELS (red/blue halves on the correct side after rotating).
+          python3 tests/integration_rotation.py /tmp/smoke-pkg/rtv
+
+      # ---- GUI variant (--features gui) ----------------------------------
+      # Built AFTER packaging the terminal binary because both builds
+      # write target/release/rtv. The library closure is recomputed with
+      # ldd in case eframe added NEEDED entries in the future (today
+      # winit/wgpu load X11/Wayland/Vulkan via dlopen and add nothing).
+      - name: Build GUI variant (--features gui)
+        run: |
+          export FFMPEG_DIR="$HOME/ffmpeg"
+          cargo build --release --locked --features gui
+
+      - name: GUI integration test (Xvfb + software rendering)
+        env:
+          LD_LIBRARY_PATH: ${{ env.FFMPEG_DIR }}/lib
+        run: |
+          python3 tests/integration_gui.py target/release/rtv
+
+      - name: Package GUI variant
+        id: pkggui
+        run: |
+          set -euo pipefail
+          base="${{ steps.pkg.outputs.pkg }}"
+          gui="${base}-gui"
+          cp -r "dist/$base" "dist/$gui"
+          cp target/release/rtv "dist/$gui/rtv"
+          sysre='linux-vdso|ld-linux|libc\.so|libm\.so|libdl\.so|libpthread\.so|librt\.so|libgcc_s|libmvec|libasound'
+          while read -r name path; do
+            [[ "$name" =~ $sysre ]] && continue
+            [[ -e "dist/$gui/lib/$(basename "$path")" ]] || cp -L "$path" "dist/$gui/lib/"
+          done < <(LD_LIBRARY_PATH="$FFMPEG_DIR/lib" ldd target/release/rtv | awk '/=>/ {print $1, $3}')
+          patchelf --set-rpath '$ORIGIN/lib' "dist/$gui/rtv"
+          for so in "dist/$gui/lib/"*; do patchelf --set-rpath '$ORIGIN' "$so"; done
+          tar -C dist -czf "$gui.tar.gz" "$gui"
+          echo "pkg=$gui" >> "$GITHUB_OUTPUT"
+
+      - name: GUI smoke test (relocatable package)
+        run: |
+          set -euo pipefail
+          gui="${{ steps.pkggui.outputs.pkg }}"
+          cp -r "dist/$gui" /tmp/smoke-gui
+          ldd /tmp/smoke-gui/rtv | tee /tmp/ldd-gui.txt
+          ! grep -q "not found" /tmp/ldd-gui.txt
+          /tmp/smoke-gui/rtv --version
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: ${{ steps.pkg.outputs.pkg }}.tar.gz
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkggui.outputs.pkg }}
+          path: ${{ steps.pkggui.outputs.pkg }}.tar.gz
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- Windows --
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # https on Windows: BtbN builds compile with --enable-schannel
+      # (native system TLS, verified in BtbN/FFmpeg-Builds
+      # scripts.d/50-schannel.sh) — network playback works without
+      # bundling anything extra.
+      - name: Download FFmpeg 7.1 shared (BtbN, pinned tag)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/$env:FF_WIN_TAG/$env:FF_WIN_ASSET"
+          Invoke-WebRequest -Uri $url -OutFile C:\ffmpeg.zip
+          Expand-Archive C:\ffmpeg.zip -DestinationPath C:\ffdl
+          $inner = Get-ChildItem C:\ffdl -Directory | Select-Object -First 1
+          Move-Item $inner.FullName C:\ffmpeg
+          "FFMPEG_DIR=C:\ffmpeg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      # The LLVM 20.1.8 preinstalled on windows-latest crashes (STATUS_ACCESS_
+      # VIOLATION in the ffmpeg-sys-the-third build script): clang-sys 1.8.1
+      # (pinned by Cargo.lock) supports libclang up to 18 -> LLVM 18.
+      # Direct download from the official release (KyleMayes/install-llvm-action
+      # was used before, but it is still on Node 20 -> deprecation warning).
+      # Only libclang.dll + clang's builtin headers are needed; they are
+      # extracted selectively from the NSIS installer with 7z (preinstalled).
+      - name: Install LLVM 18 (libclang compatible with clang-sys 1.8)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/LLVM-18.1.8-win64.exe"
+          curl.exe -fsSL --retry 5 --retry-all-errors -o C:\llvm18.exe $url
+          # Extract only what clang-sys/bindgen needs (clean dir: the default
+          # C:\Program Files\LLVM would mix with the runner's LLVM 20).
+          7z x C:\llvm18.exe -oC:\llvm18 "bin\libclang.dll" "lib\clang" | Out-Null
+          if (-not (Test-Path C:\llvm18\bin\libclang.dll)) { throw "libclang.dll missing" }
+          "LIBCLANG_PATH=C:\llvm18\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package (rtv.exe + FFmpeg DLLs)
+        id: pkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:GITHUB_REF -like "refs/tags/*") { $ver = $env:GITHUB_REF_NAME }
+          elseif ("${{ inputs.release_tag }}" -ne "") { $ver = "${{ inputs.release_tag }}" }
+          else { $ver = $env:GITHUB_SHA.Substring(0,7) }
+          $pkg = "rtv-$ver-windows-x86_64"
+          New-Item -ItemType Directory -Path "dist\$pkg" | Out-Null
+          Copy-Item target\release\rtv.exe "dist\$pkg\"
+          # Only the 5 families rtv links against (no avfilter/avdevice).
+          foreach ($fam in "avutil","avcodec","avformat","swscale","swresample") {
+            $dll = Get-ChildItem "C:\ffmpeg\bin\$fam-*.dll"
+            if (-not $dll) { throw "$fam-*.dll missing" }
+            Copy-Item $dll.FullName "dist\$pkg\"
+          }
+          Copy-Item C:\ffmpeg\LICENSE.txt "dist\$pkg\LICENSE-ffmpeg.txt"
+          Copy-Item README.md "dist\$pkg\"
+          # Official standalone yt-dlp.exe: fallback when the user has
+          # none on the PATH (rtv prefers the one on the PATH). With
+          # self-update (yt-dlp -U) it never gets frozen in time.
+          curl.exe -fsSL --retry 5 --retry-all-errors -o "dist\$pkg\yt-dlp.exe" `
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+          & "dist\$pkg\yt-dlp.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "yt-dlp.exe does not start" }
+          Copy-Item ci\LICENSE-yt-dlp.txt "dist\$pkg\"
+          Compress-Archive -Path "dist\$pkg" -DestinationPath "$pkg.zip"
+          "pkg=$pkg" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Smoke test (DLLs resolved from the exe dir)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pkg = "${{ steps.pkg.outputs.pkg }}"
+          # Copy to another path WITHOUT C:\ffmpeg on the PATH: if --version
+          # starts, the loader resolved the DLLs from the package dir itself.
+          Copy-Item -Recurse "dist\$pkg" "$env:TEMP\smoke-pkg"
+          $env:Path = ($env:Path -split ";" | Where-Object { $_ -notlike "*ffmpeg*" }) -join ";"
+          & "$env:TEMP\smoke-pkg\rtv.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "smoke test failed" }
+
+      # ---- GUI variant (--features gui) --------------------------------
+      # eframe/wgpu use the system's D3D12/Vulkan on Windows: they add no
+      # new DLLs to the package (same 5 FFmpeg families). Built AFTER
+      # packaging the terminal variant because both builds write
+      # target\release\rtv.exe.
+      - name: Build GUI variant (--features gui)
+        run: cargo build --release --locked --features gui
+
+      # Native Win32 GRAPHICAL test in pure Python (ctypes user32/gdi32):
+      # EnumWindows locates the rtv window, PrintWindow with
+      # PW_RENDERFULLCONTENT captures the D3D12/wgpu contents, PostMessage
+      # injects the `q`. Verifies window + render with real color + video
+      # progress + clean exit on q (exit 0). Nothing to install.
+      # FFmpeg DLLs resolve by putting C:\ffmpeg\bin on the PATH
+      # (target\release\rtv.exe is not bundled with them yet).
+      - name: GUI integration test (native Win32 window)
+        shell: pwsh
+        run: |
+          $env:Path = "C:\ffmpeg\bin;$env:Path"
+          python tests\integration_gui_windows.py target\release\rtv.exe
+          if ($LASTEXITCODE -ne 0) { throw "GUI test failed" }
+
+      - name: Package GUI variant
+        id: pkggui
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $base = "${{ steps.pkg.outputs.pkg }}"
+          $gui = "$base-gui"
+          Copy-Item -Recurse "dist\$base" "dist\$gui"
+          Copy-Item target\release\rtv.exe "dist\$gui\" -Force
+          Compress-Archive -Path "dist\$gui" -DestinationPath "$gui.zip"
+          "pkg=$gui" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: GUI smoke test (DLLs resolved from the exe dir)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $gui = "${{ steps.pkggui.outputs.pkg }}"
+          Copy-Item -Recurse "dist\$gui" "$env:TEMP\smoke-gui"
+          $env:Path = ($env:Path -split ";" | Where-Object { $_ -notlike "*ffmpeg*" }) -join ";"
+          & "$env:TEMP\smoke-gui\rtv.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "GUI smoke test failed" }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: ${{ steps.pkg.outputs.pkg }}.zip
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkggui.outputs.pkg }}
+          path: ${{ steps.pkggui.outputs.pkg }}.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- macOS --
+  macos:
+    name: macos-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel   # last Intel runner available
+            arch: x86_64
+          - runner: macos-14         # Apple Silicon
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Dependencies (brew)
+        run: brew install nasm dav1d dylibbundler pkgconf
+
+      - name: Built FFmpeg cache
+        id: ffcache
+        uses: actions/cache@v6
+        with:
+          path: ~/ffmpeg
+          key: ffmpeg-${{ env.FF_SRC_VERSION }}-dav1d-sectransport-${{ matrix.runner }}-v1
+
+      - name: Build FFmpeg ${{ env.FF_SRC_VERSION }} from source (minimal LGPL)
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # GitHub mirror as primary: ffmpeg.org resets connections
+          # from the runners (curl 35). Fallback to ffmpeg.org just in case.
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg-src.tar \
+            "https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n${FF_SRC_VERSION}.tar.gz" || \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o /tmp/ffmpeg-src.tar \
+            "https://ffmpeg.org/releases/ffmpeg-${FF_SRC_VERSION}.tar.xz"
+          mkdir -p /tmp/ffmpeg-src
+          tar -xf /tmp/ffmpeg-src.tar -C /tmp/ffmpeg-src --strip-components=1
+          cd /tmp/ffmpeg-src
+          export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          # Minimal config for rtv: DECODE only. No avfilter/avdevice (the
+          # crate does not use them), no encoders/muxers. dav1d = decent
+          # software AV1; VideoToolbox = hwdec (rtv's --hwdec auto).
+          # SecureTransport = https with the system TLS (macOS Security
+          # framework): nothing extra to bundle. Explicit so that
+          # configure fails loudly if it is missing.
+          ./configure --prefix="$HOME/ffmpeg" \
+            --enable-shared --disable-static \
+            --disable-programs --disable-doc \
+            --disable-avdevice --disable-avfilter \
+            --disable-encoders --disable-muxers \
+            --enable-libdav1d \
+            --enable-videotoolbox --enable-audiotoolbox \
+            --enable-securetransport
+          grep -q "CONFIG_HTTPS_PROTOCOL 1" config_components.h
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+          cp COPYING.LGPLv2.1 "$HOME/ffmpeg/LICENSE.txt"
+
+      - name: Build rtv
+        run: |
+          export FFMPEG_DIR="$HOME/ffmpeg"
+          cargo build --release --locked
+
+      - name: Package (dylibs via @executable_path + ad-hoc signing)
+        id: pkg
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then ver="$GITHUB_REF_NAME"
+          elif [[ -n "${{ inputs.release_tag }}" ]]; then ver="${{ inputs.release_tag }}"
+          else ver="${GITHUB_SHA::7}"; fi
+          pkg="rtv-${ver}-macos-${{ matrix.arch }}"
+          mkdir -p "dist/$pkg/libs"
+          cp target/release/rtv "dist/$pkg/"
+          # dylibbundler copies the dylibs (ffmpeg + dav1d, recursive), rewrites
+          # install names to @executable_path/libs/ and fixes the refs between
+          # dylibs. System frameworks (VideoToolbox...) are left alone.
+          dylibbundler -od -b \
+            -x "dist/$pkg/rtv" \
+            -d "dist/$pkg/libs" \
+            -p '@executable_path/libs/' \
+            -s "$HOME/ffmpeg/lib" \
+            -s "$(brew --prefix)/lib"
+          # Re-sign (install_name_tool invalidates the signature; on arm64 a
+          # binary without a valid signature does not even start).
+          codesign --force --sign - "dist/$pkg/libs/"*.dylib "dist/$pkg/rtv"
+          # Verification: no references to build/homebrew paths.
+          otool -L "dist/$pkg/rtv" | tee /tmp/otool.txt
+          ! grep -Eq "$HOME/ffmpeg|/opt/homebrew|/usr/local/(opt|Cellar)" /tmp/otool.txt
+          for dylib in "dist/$pkg/libs/"*.dylib; do
+            otool -L "$dylib" | grep -Eq "$HOME/ffmpeg|/opt/homebrew|/usr/local/(opt|Cellar)" && exit 1 || true
+          done
+          cp "$HOME/ffmpeg/LICENSE.txt" "dist/$pkg/LICENSE-ffmpeg.txt"
+          cp README.md "dist/$pkg/"
+          # Official yt-dlp_macos (universal2): fallback when none is on
+          # the PATH; self-updates via `yt-dlp -U`.
+          curl -fsSL --retry 5 --retry-all-errors -o "dist/$pkg/yt-dlp" \
+            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos"
+          chmod +x "dist/$pkg/yt-dlp"
+          "dist/$pkg/yt-dlp" --version   # sanity check on the runner arch
+          cp ci/LICENSE-yt-dlp.txt "dist/$pkg/"
+          tar -C dist -czf "$pkg.tar.gz" "$pkg"
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test (relocatable package)
+        run: |
+          set -euo pipefail
+          pkg="${{ steps.pkg.outputs.pkg }}"
+          cp -R "dist/$pkg" "$TMPDIR/smoke-pkg"
+          # On macOS the dylibs load at process start: if --version works
+          # from another path, the @executable_path relocation is correct.
+          "$TMPDIR/smoke-pkg/rtv" --version
+
+      # ---- GUI variant (--features gui) ----------------------------------
+      # eframe uses the system's Metal (wgpu) on macOS: it adds no new
+      # dylibs to the package. Built AFTER packaging the terminal variant
+      # because both builds write target/release/rtv. NOTE: the fresh
+      # binary needs ITS OWN dylibbundler pass + ad-hoc re-sign (FFmpeg
+      # install names point to $HOME/ffmpeg out of the box).
+      - name: Build GUI variant (--features gui)
+        run: |
+          export FFMPEG_DIR="$HOME/ffmpeg"
+          cargo build --release --locked --features gui
+
+      # GRAPHICAL test on native macOS (Cocoa + Metal): screencapture -l
+      # of the real rtv window + CGWindowListCopyWindowInfo (swiftc)
+      # + BMP analysis in pure Python. No X/xdotool: verifies window,
+      # render with real color and video progress; the `q` exit is
+      # best-effort (osascript needs accessibility permission — the
+      # key contract is covered by the linux test with XTEST).
+      # DYLD: the freshly built binary still points to $HOME/ffmpeg
+      # (dylibbundler runs later, at packaging time).
+      - name: GUI integration test (native window)
+        run: |
+          export DYLD_LIBRARY_PATH="$HOME/ffmpeg/lib"
+          python3 tests/integration_gui_macos.py target/release/rtv
+
+      - name: Package GUI variant
+        id: pkggui
+        run: |
+          set -euo pipefail
+          base="${{ steps.pkg.outputs.pkg }}"
+          gui="${base}-gui"
+          cp -R "dist/$base" "dist/$gui"
+          cp target/release/rtv "dist/$gui/rtv"
+          dylibbundler -od -b \
+            -x "dist/$gui/rtv" \
+            -d "dist/$gui/libs" \
+            -p '@executable_path/libs/' \
+            -s "$HOME/ffmpeg/lib" \
+            -s "$(brew --prefix)/lib"
+          codesign --force --sign - "dist/$gui/libs/"*.dylib "dist/$gui/rtv"
+          otool -L "dist/$gui/rtv" | tee /tmp/otool-gui.txt
+          ! grep -Eq "$HOME/ffmpeg|/opt/homebrew|/usr/local/(opt|Cellar)" /tmp/otool-gui.txt
+          tar -C dist -czf "$gui.tar.gz" "$gui"
+          echo "pkg=$gui" >> "$GITHUB_OUTPUT"
+
+      - name: GUI smoke test (relocatable package)
+        run: |
+          set -euo pipefail
+          gui="${{ steps.pkggui.outputs.pkg }}"
+          cp -R "dist/$gui" "$TMPDIR/smoke-gui"
+          "$TMPDIR/smoke-gui/rtv" --version
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: ${{ steps.pkg.outputs.pkg }}.tar.gz
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkggui.outputs.pkg }}
+          path: ${{ steps.pkggui.outputs.pkg }}.tar.gz
+          if-no-files-found: error
+
+  # ------------------------------------------------------ Termux (Android) --
+  # Build and tests inside termux/termux-docker containers: a REAL Termux
+  # userland (bionic libc, prefix /data/data/com.termux/files/usr, pkg),
+  # the same platform as a phone except for the missing Android pieces
+  # (DalvikVM, AAudio — which is exactly why rtv uses PulseAudio there).
+  # No physical device is needed to validate anything.
+  termux:
+    name: termux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-22.04-arm   # NATIVE aarch64 container (no qemu)
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # HOME of the termux user inside the container.
+      TXH: /data/data/com.termux/files/home
+    steps:
+      - uses: actions/checkout@v7
+
+      # FFmpeg 7.1.5 built INSIDE the container, cached across runs
+      # (the key includes the script in case the recipe changes).
+      - name: FFmpeg cache (Termux)
+        id: ffcache
+        uses: actions/cache@v6
+        with:
+          path: ffcache
+          key: ffmpeg-termux-${{ matrix.arch }}-${{ env.FF_SRC_VERSION }}-${{ hashFiles('scripts/build-termux.sh') }}
+
+      - name: Start Termux container
+        run: |
+          # seccomp unconfined: termux containers (arm especially) need
+          # syscalls that Docker's default profile blocks
+          # (personality — see the termux-docker README).
+          docker run -d --name tx --security-opt seccomp=unconfined \
+            termux/termux-docker:${{ matrix.arch }} sleep infinity
+          docker exec -u 1000 tx uname -m
+          # Termux mirrors get out of sync often (indexes with
+          # "unexpected size", impossible deps like "ncurses (= X) but Y
+          # is to be installed"...). Every `pkg install` in the job goes
+          # through scripts/termux-pkg.sh, which ROTATES official mirrors
+          # until it finds a consistent one.
+
+      - name: Copy repo (+ FFmpeg cache) into the container
+        run: |
+          docker cp . tx:$TXH/rtv
+          if [ -d ffcache/rtv-ffmpeg ]; then
+            docker cp ffcache/rtv-ffmpeg tx:$TXH/rtv-ffmpeg
+          fi
+          # The COPY from the runner arrives as root; the termux user is 1000.
+          docker exec -u 0 tx chown -R 1000:1000 $TXH
+
+      - name: Native build (scripts/build-termux.sh — the SAME one users run)
+        run: |
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx \
+            bash scripts/build-termux.sh
+
+      - name: Export FFmpeg to the cache
+        if: steps.ffcache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ffcache
+          docker cp tx:$TXH/rtv-ffmpeg ffcache/rtv-ffmpeg
+
+      - name: Fixtures + test deps (python, ffmpeg CLI, pulseaudio)
+        run: |
+          # ffmpeg from the Termux repos (8.x): as a test fixture ONLY.
+          # It does not interfere with the bundled 7.1 (different sonames
+          # and the rtv wrapper prepends its own LD_LIBRARY_PATH).
+          # termux user (1000): the prefix is theirs, so the helper can
+          # rewrite sources.list when rotating mirrors.
+          docker exec -u 1000 -e HOME=$TXH tx sh $TXH/rtv/scripts/termux-pkg.sh python ffmpeg pulseaudio
+          # Video without audio (smoke) and with audio (pulse backend test).
+          docker exec -u 1000 -e HOME=$TXH tx sh -c \
+            'ffmpeg -y -loglevel error -f lavfi -i testsrc2=size=320x180:rate=30 -t 2 -c:v mpeg4 -an $HOME/smoke.mp4'
+          docker exec -u 1000 -e HOME=$TXH tx sh -c \
+            'ffmpeg -y -loglevel error -f lavfi -i testsrc2=size=320x180:rate=30 -f lavfi -i sine=frequency=440:sample_rate=48000 -t 6 -c:v mpeg4 -c:a aac -shortest $HOME/smoke_audio.mp4'
+
+      - name: Smoke test (real pty, --no-audio)
+        run: |
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx \
+            python3 ci/smoke_pty.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke.mp4
+
+      - name: NETWORK smoke test (local http inside the Termux userland)
+        run: |
+          # Validates libavformat's network stack (open→demux→decode) on
+          # bionic. The TLS layer was already verified in the build's config.h.
+          docker exec -d -u 1000 -e HOME=$TXH tx \
+            python3 -m http.server 8123 --bind 127.0.0.1 --directory $TXH
+          sleep 2
+          docker exec -u 1000 -e HOME=$TXH tx \
+            rtv --info http://127.0.0.1:8123/smoke.mp4
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx \
+            python3 ci/smoke_pty.py /data/data/com.termux/files/usr/bin/rtv http://127.0.0.1:8123/smoke.mp4
+
+      - name: Real AUDIO test (PulseAudio null-sink, pulse backend)
+        run: |
+          # PulseAudio 17 (the same package a Termux user installs) with
+          # a null-sink: there is no audio hardware in the container, but
+          # the SERVER and the protocol are 100% real — pa_simple_new,
+          # paced writes, get_latency... rtv's whole code path.
+          # TCP loopback protocol (standard Termux recipe): the default
+          # unix socket lives in a per-session runtime dir that is NOT
+          # reliably shared across separate `docker exec` calls.
+          docker exec -u 1000 -e HOME=$TXH tx sh -c \
+            'pulseaudio --start --exit-idle-time=-1 --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" \
+             && PULSE_SERVER=127.0.0.1 pactl load-module module-null-sink sink_name=ci_sink \
+             && PULSE_SERVER=127.0.0.1 pactl info | head -3'
+          # Explicit pulse backend: requires >=20 feeder writes, the audio
+          # clock reaching >=1 s and >=95% monotonicity (REAL audio
+          # anchoring the master clock, not just "does not crash").
+          docker exec -u 1000 -e HOME=$TXH -e PULSE_SERVER=127.0.0.1 -w $TXH/rtv tx \
+            python3 ci/termux_audio_check.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke_audio.mp4 --audio-backend pulse
+          # `auto` INSIDE Termux must pick pulse on its own (detection
+          # goes through TERMUX_VERSION/PREFIX).
+          docker exec -u 1000 -e HOME=$TXH -e PULSE_SERVER=127.0.0.1 -e TERMUX_VERSION=docker -w $TXH/rtv tx \
+            python3 ci/termux_audio_check.py /data/data/com.termux/files/usr/bin/rtv $TXH/smoke_audio.mp4
+
+      - name: CLI --audio-backend (none + invalid value)
+        run: |
+          # none: plays without audio and exits cleanly.
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx sh -c \
+            'python3 ci/smoke_pty.py /data/data/com.termux/files/usr/bin/rtv $HOME/smoke.mp4 --audio-backend none'
+          # invalid: exit 2 with a visible message.
+          set +e
+          docker exec -u 1000 -e HOME=$TXH tx rtv --audio-backend patata $TXH/smoke.mp4
+          code=$?
+          set -e
+          if [ "$code" != "2" ]; then
+            echo "expected exit 2, got $code"; exit 1
+          fi
+
+      - name: Package (rtv + FULL lib closure, self-contained)
+        id: pkg
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then ver="$GITHUB_REF_NAME"
+          elif [[ -n "${{ inputs.release_tag }}" ]]; then ver="${{ inputs.release_tag }}"
+          else ver="${GITHUB_SHA::7}"; fi
+          P=rtv-${ver}-termux-${{ matrix.arch }}
+          mkdir -p "$P"
+          docker cp tx:$TXH/rtv/target/release/rtv "$P/rtv.bin"
+          # TRANSITIVE dependency closure computed INSIDE the Termux
+          # userland: our own FFmpeg + everything coming from $PREFIX/lib
+          # (e.g. libdav1d from pkg — it used to be left out and on a phone
+          # without `pkg install libdav1d` the linker failed with "library
+          # not found"). Only the bionic libs from /system stay out.
+          docker exec -u 1000 -e HOME=$TXH -w $TXH/rtv tx sh -c \
+            'python3 ci/termux_bundle_libs.py target/release/rtv $HOME/bundle-libs $HOME/rtv-ffmpeg/lib $PREFIX/lib'
+          docker cp tx:$TXH/bundle-libs "$P/libs"
+          # Sanity: the 5 FFmpeg families + libdav1d + libgnutls
+          # (https) must be present.
+          for lib in libavutil libavcodec libavformat libswscale libswresample libdav1d libgnutls; do
+            ls "$P/libs/$lib"*.so* >/dev/null || { echo "MISSING $lib in the package"; exit 1; }
+          done
+          docker cp tx:$TXH/rtv-ffmpeg/LICENSE.txt "$P/LICENSE-FFmpeg.txt" || true
+          # Relative launcher: works from any Termux path.
+          cat > "$P/rtv" << 'WRAP'
+          #!/data/data/com.termux/files/usr/bin/bash
+          DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+          export LD_LIBRARY_PATH="$DIR/libs:${LD_LIBRARY_PATH:-}"
+          exec "$DIR/rtv.bin" "$@"
+          WRAP
+          chmod +x "$P/rtv" "$P/rtv.bin"
+          cat > "$P/README.txt" << 'DOC'
+          rtv for Termux (Android)
+          ========================
+          1. Copy this folder into your Termux $HOME and (optional) link it:
+               ln -sf "$PWD/rtv" $PREFIX/bin/rtv
+          2. Audio: pkg install pulseaudio
+                    pulseaudio --start --exit-idle-time=-1
+          3. Play: rtv video.mp4
+          4. YouTube and other sites (there is no yt-dlp build for Android):
+               pkg install python-pip && pip install yt-dlp
+             and then: rtv "https://www.youtube.com/watch?v=..."
+          Requires Termux from F-Droid (not the abandoned Play Store build).
+          DOC
+          tar -czf "$P.tar.gz" "$P"
+          echo "pkg=$P" >> "$GITHUB_OUTPUT"
+
+      # Reproduces EXACTLY a user's situation: a FRESHLY created Termux
+      # container (without the deps the build installed: no libdav1d, no
+      # rust, no pulseaudio) that only receives the release tar.gz.
+      # If any library is missing from the package, `rtv --version` blows
+      # up here with "library ... not found" BEFORE anything is published.
+      - name: CLEAN install test (container without build deps)
+        run: |
+          set -euo pipefail
+          P="${{ steps.pkg.outputs.pkg }}"
+          docker run -d --name clean --security-opt seccomp=unconfined \
+            termux/termux-docker:${{ matrix.arch }} sleep infinity
+          docker cp "$P.tar.gz" clean:$TXH/
+          # Mirror helper (same reason as in the build container).
+          docker cp scripts/termux-pkg.sh clean:$TXH/termux-pkg.sh
+          # Fixture generated in the build container (installing ffmpeg here
+          # would drag in libdav1d and mask exactly what we are testing).
+          docker cp tx:$TXH/smoke.mp4 /tmp/smoke.mp4
+          docker cp /tmp/smoke.mp4 clean:$TXH/smoke.mp4
+          docker cp ci/smoke_pty.py clean:$TXH/smoke_pty.py
+          docker exec -u 0 clean chown -R 1000:1000 $TXH
+          docker exec -u 1000 -e HOME=$TXH -w $TXH clean sh -c "tar -xzf $P.tar.gz"
+          # 1) The linker loads ALL the NEEDED libs at startup: if one is
+          #    missing, this fails right here (the real-device bug).
+          docker exec -u 1000 -e HOME=$TXH clean $TXH/$P/rtv --version
+          # 2) Real playback in a pty. Only python gets installed (it pulls
+          #    no multimedia libs). No pulseaudio: `auto` must degrade
+          #    cleanly to video without audio, like on a freshly set up phone.
+          docker exec -u 1000 -e HOME=$TXH clean sh $TXH/termux-pkg.sh python
+          docker exec -u 1000 -e HOME=$TXH -w $TXH clean \
+            python3 smoke_pty.py $TXH/$P/rtv smoke.mp4
+          docker rm -f clean
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.pkg }}
+          path: ${{ steps.pkg.outputs.pkg }}.tar.gz
+          if-no-files-found: error
+
+  # -------------------------------------------------------------- Release --
+  # A release is created in two cases:
+  #   * push of a v* tag (as usual), or
+  #   * manual Run workflow WITH the release_tag input filled in (creates the tag).
+  # The release_message input (Markdown) goes above the downloads table.
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+    needs: [linux, windows, macos, termux]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compose release body (Markdown message + table)
+        env:
+          MSG: ${{ inputs.release_message }}
+        run: |
+          set -euo pipefail
+          {
+            if [ -n "$MSG" ]; then
+              # The form field is single-line: literal "\n" sequences are
+              # turned into real newlines so lists, paragraphs, etc. can be
+              # written. Everything else passes AS IS (Markdown supported).
+              printf '%s\n' "$MSG" | sed 's/\\n/\n/g'
+              printf '\n---\n\n'
+            fi
+            cat << 'TABLE'
+          ## English
+
+          Self-contained binaries: **FFmpeg 7.1 is bundled inside every
+          package** — nothing else needs to be installed. The
+          Linux/Windows/macOS packages also include **yt-dlp** (to play
+          YouTube URLs and the like: `rtv <url>`); rtv will use the one on
+          your PATH if you have a newer one, and the bundled copy updates
+          itself with `yt-dlp -U`. Termux has no yt-dlp build for Android:
+          `pip install yt-dlp`.
+
+          Each desktop platform ships **two packages**: the regular one
+          (terminal only) and the `-gui` one, which is the same rtv with
+          the extra window mode (`rtv --gui video.mp4`); everything else is
+          identical. Termux has no GUI variant (Android ships no X server;
+          it would need Termux:X11 separately).
+
+          | Platform | File | Requirements |
+          |---|---|---|
+          | Linux x86_64 | `rtv-*-linux-x86_64.tar.gz` | glibc ≥ 2.35 (Ubuntu 22.04+), libasound2 |
+          | Linux x86_64 (GUI) | `rtv-*-linux-x86_64-gui.tar.gz` | same + X11/Wayland |
+          | Linux arm64 | `rtv-*-linux-arm64.tar.gz` | glibc ≥ 2.35 (Ubuntu 22.04+), libasound2 |
+          | Linux arm64 (GUI) | `rtv-*-linux-arm64-gui.tar.gz` | same + X11/Wayland |
+          | Windows x86_64 | `rtv-*-windows-x86_64.zip` | Windows 10+ |
+          | Windows x86_64 (GUI) | `rtv-*-windows-x86_64-gui.zip` | Windows 10+ |
+          | macOS Intel | `rtv-*-macos-x86_64.tar.gz` | macOS 13+ |
+          | macOS Intel (GUI) | `rtv-*-macos-x86_64-gui.tar.gz` | macOS 13+ |
+          | macOS Apple Silicon | `rtv-*-macos-arm64.tar.gz` | macOS 14+ |
+          | macOS Apple Silicon (GUI) | `rtv-*-macos-arm64-gui.tar.gz` | macOS 14+ |
+          | Termux/Android aarch64 | `rtv-*-termux-aarch64.tar.gz` | Termux from F-Droid; audio: `pkg install pulseaudio` |
+          | Termux/Android x86_64 | `rtv-*-termux-x86_64.tar.gz` | (emulators/Android-x86) |
+
+          Usage: extract and run `./rtv video.mp4` (Windows: `rtv.exe video.mp4`).
+          The binary must stay next to its `lib/`/`libs/` folder (Linux/macOS/Termux)
+          or next to the DLLs (Windows).
+
+          ## Español
+
+          Binarios autocontenidos: **FFmpeg 7.1 va incluido dentro de cada
+          paquete** — no hay que instalar nada más. Los paquetes de
+          Linux/Windows/macOS incluyen además **yt-dlp** (para reproducir
+          URLs de YouTube y demás: `rtv <url>`); rtv usará el del PATH si
+          tienes uno más nuevo, y el incluido se actualiza con `yt-dlp -U`.
+          En Termux no hay build de yt-dlp para Android: `pip install yt-dlp`.
+
+          Cada plataforma de escritorio tiene **dos paquetes**: el normal
+          (solo terminal) y el `-gui`, que es el mismo rtv con el modo
+          ventana adicional (`rtv --gui vídeo.mp4`); todo lo demás es
+          idéntico. Termux no tiene variante GUI (Android no trae servidor
+          X; haría falta Termux:X11 aparte).
+
+          | Plataforma | Fichero | Requisitos |
+          |---|---|---|
+          | Linux x86_64 | `rtv-*-linux-x86_64.tar.gz` | glibc ≥ 2.35 (Ubuntu 22.04+), libasound2 |
+          | Linux x86_64 (GUI) | `rtv-*-linux-x86_64-gui.tar.gz` | ídem + X11/Wayland |
+          | Linux arm64 | `rtv-*-linux-arm64.tar.gz` | glibc ≥ 2.35 (Ubuntu 22.04+), libasound2 |
+          | Linux arm64 (GUI) | `rtv-*-linux-arm64-gui.tar.gz` | ídem + X11/Wayland |
+          | Windows x86_64 | `rtv-*-windows-x86_64.zip` | Windows 10+ |
+          | Windows x86_64 (GUI) | `rtv-*-windows-x86_64-gui.zip` | Windows 10+ |
+          | macOS Intel | `rtv-*-macos-x86_64.tar.gz` | macOS 13+ |
+          | macOS Intel (GUI) | `rtv-*-macos-x86_64-gui.tar.gz` | macOS 13+ |
+          | macOS Apple Silicon | `rtv-*-macos-arm64.tar.gz` | macOS 14+ |
+          | macOS Apple Silicon (GUI) | `rtv-*-macos-arm64-gui.tar.gz` | macOS 14+ |
+          | Termux/Android aarch64 | `rtv-*-termux-aarch64.tar.gz` | Termux de F-Droid; audio: `pkg install pulseaudio` |
+          | Termux/Android x86_64 | `rtv-*-termux-x86_64.tar.gz` | (emuladores/Android-x86) |
+
+          Uso: descomprimir y ejecutar `./rtv vídeo.mp4` (Windows: `rtv.exe vídeo.mp4`).
+          El binario debe permanecer junto a su carpeta `lib/`/`libs/` (Linux/macOS/Termux)
+          o junto a las DLLs (Windows).
+          TABLE
+          } > release_body.md
+          echo "---- generated body ----"; cat release_body.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          body_path: release_body.md
+          # On manual dispatch there is no tag in the ref: the input is used
+          # and the tag is created on the exact commit that built the artifacts.
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ inputs.prerelease || false }}

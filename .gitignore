@@ -1,0 +1,7 @@
+/target
+testdata/
+testmedia/
+*.mp4
+*.mkv
+*.webm
+__pycache__/
