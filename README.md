@@ -182,7 +182,7 @@ rtv runs natively on Termux (no proot, no containers). The script
 
 ```bash
 pkg install -y git
-git clone https://github.com/correo415415/rtv.git && cd rtv
+git clone https://github.com/Santitub/rtv.git && cd rtv
 bash scripts/build-termux.sh
 rtv video.mp4
 ```
