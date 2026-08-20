@@ -1,5 +1,7 @@
 # rtv
 
+![build](https://github.com/Santitub/rtv/actions/workflows/build.yml/badge.svg)
+
 *Léelo en [español](README_ES.md).*
 
 A terminal video player written in Rust. Genuinely fast: it starts in tens
@@ -13,6 +15,14 @@ rtv movie.mkv
 
 That's it. It detects the terminal, picks the best rendering backend, sends
 audio to the default device, and plays.
+
+## Quick start
+
+Grab a prebuilt binary from the [latest release](../../releases) and run:
+
+```bash
+tar -xzf rtv-*-linux-x86_64.tar.gz && cd rtv-*/ && ./rtv video.mp4
+```
 
 ## Demos
 
@@ -347,9 +357,10 @@ RTX 30+). The fallback is negotiated per stream, not global: if the AV1
 decoder doesn't advertise the hwaccel, that video goes through software
 even if another H.264 on the same machine uses the GPU.
 
-> Note: the actual GPU gain (CPU%/fps with and without `--hwdec`) is
-> still to be measured outside the CI sandbox (which has no `/dev/dri`;
-> there only the fallback path is validated).
+> **Measured on an RTX 3060 (Linux, NVIDIA driver 580.173.02):** `--hwdec auto`
+> completed an 8-second HEVC clip in **0.77 s** of CPU time vs **2.86 s**
+> with `--hwdec none` (software), and **10.77 s** for `mpv --vo=tct` on the
+> same clip — a **14× reduction** in CPU vs terminal mpv.
 
 ### Controls
 
